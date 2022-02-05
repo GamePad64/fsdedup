@@ -6,7 +6,8 @@ use std::io::{BufReader, Error, Read};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::{fs, io};
+use std::sync::mpsc;
+use std::{fs, io, thread};
 use tracing::{debug, info, trace, warn};
 use walkdir::WalkDir;
 
@@ -33,6 +34,7 @@ enum BlockDedupError {
     FileErrors(Option<io::Error>, Option<io::Error>),
 }
 
+#[tracing::instrument]
 fn dedup(block1: BlockLocation, block2: BlockLocation) -> Result<(), BlockDedupError> {
     debug!(
         "Trying to DEDUP {:?}[{}..{}], {:?}[{}..{}]",
@@ -68,7 +70,7 @@ fn dedup(block1: BlockLocation, block2: BlockLocation) -> Result<(), BlockDedupE
                 dest_infos: vec![DedupeRangeDestInfo {
                     dest_fd: file2.as_raw_fd() as i64,
                     dest_offset: block2.offset,
-                    bytes_deduped: 0,
+                    bytes_deduped: block2.length as u64,
                     status: DedupeRangeStatus::Same,
                 }],
             };
@@ -98,6 +100,10 @@ struct Args {
     /// Deduplication block size
     #[clap(short)]
     block_size: usize,
+
+    /// Queue size for storing dedup tasks between scan and deduplication
+    #[clap(short, default_value_t = 32)]
+    dedup_queue: usize,
 }
 
 type Hash = u64;
@@ -173,14 +179,8 @@ fn scan_file(path: &Path, block_size: usize) -> Result<ScanResult, ScanError> {
     Ok(result)
 }
 
-fn main() {
-    tracing_subscriber::fmt::init();
-
-    let args = Args::parse();
-
-    let mut inodes: HashMap<_, BlockLocation> = HashMap::new();
-
-    let walk_iter = args.root.iter().flat_map(|path| {
+fn crawl_paths(paths: &[PathBuf], block_size: usize, scanned_tx: mpsc::SyncSender<ScanResult>) {
+    let walk_iter = paths.iter().flat_map(|path| {
         WalkDir::new(path)
             .same_file_system(true)
             .into_iter()
@@ -190,37 +190,56 @@ fn main() {
 
     for entry in walk_iter {
         let path = entry.path();
-
-        let scan_result = scan_file(path, args.block_size);
+        let scan_result = scan_file(path, block_size);
 
         if let Ok(scan_result) = scan_result {
-            for (number, block_hash) in scan_result.block_hashes.iter().enumerate() {
-                let block_location = scan_result.get_block_location(number);
-
-                match inodes.get(block_hash) {
-                    Some(x) => {
-                        let res = dedup(x.clone(), block_location);
-                        match res {
-                            Ok(_) => {}
-                            Err(BlockDedupError::SameBlock { block }) => {
-                                warn!("Block dedup struct points to exact same block: {block:?}");
-                            }
-                            Err(BlockDedupError::SameExtent { .. }) => {
-                                warn!("Possible hardlinks detected: {:?}", res.err());
-                            }
-                            Err(BlockDedupError::DedupInternal(e)) => {
-                                warn!("Dedup returned error: {e}");
-                            }
-                            Err(BlockDedupError::FileErrors(e1, e2)) => {
-                                warn!("I/O error: {e1:?}, {e2:?}");
-                            }
-                        }
-                    }
-                    None => {
-                        inodes.insert(*block_hash, block_location);
-                    }
-                };
-            }
+            scanned_tx.send(scan_result).unwrap();
         }
     }
+}
+
+fn main() {
+    tracing_subscriber::fmt::init();
+
+    let args = Args::parse();
+
+    let mut inodes: HashMap<_, BlockLocation> = HashMap::new();
+
+    let (scanned_tx, scanned_rx) = mpsc::sync_channel(args.dedup_queue);
+
+    let crawler_handle = thread::spawn(move || {
+        crawl_paths(&args.root, args.block_size, scanned_tx);
+    });
+
+    while let Ok(scan_result) = scanned_rx.recv() {
+        for (number, block_hash) in scan_result.block_hashes.iter().enumerate() {
+            let block_location = scan_result.get_block_location(number);
+
+            match inodes.get(block_hash) {
+                Some(x) => {
+                    let res = dedup(x.clone(), block_location);
+                    match res {
+                        Ok(_) => {}
+                        Err(BlockDedupError::SameBlock { block }) => {
+                            warn!("Block dedup struct points to exact same block: {block:?}");
+                        }
+                        Err(BlockDedupError::SameExtent { .. }) => {
+                            warn!("Possible hardlinks detected: {:?}", res.err());
+                        }
+                        Err(BlockDedupError::DedupInternal(e)) => {
+                            warn!("Dedup returned error: {e}");
+                        }
+                        Err(BlockDedupError::FileErrors(e1, e2)) => {
+                            warn!("I/O error: {e1:?}, {e2:?}");
+                        }
+                    }
+                }
+                None => {
+                    inodes.insert(*block_hash, block_location);
+                }
+            };
+        }
+    }
+
+    crawler_handle.join();
 }
