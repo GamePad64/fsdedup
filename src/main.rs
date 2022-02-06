@@ -8,7 +8,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::{fs, io, thread};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -19,6 +19,7 @@ struct BlockLocation {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum BlockDedupError {
     SameBlock {
         block: BlockLocation,
@@ -241,5 +242,5 @@ fn main() {
         }
     }
 
-    crawler_handle.join();
+    let _ = crawler_handle.join();
 }
