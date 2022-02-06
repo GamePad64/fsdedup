@@ -1,6 +1,7 @@
 use btrfs::{deduplicate_range, DedupeRange, DedupeRangeDestInfo, DedupeRangeStatus};
 use clap::Parser;
 use crc64fast::Digest;
+use rayon::iter::{ParallelBridge, ParallelIterator};
 use std::collections::HashMap;
 use std::io::{BufReader, Error, Read};
 use std::os::unix::fs::MetadataExt;
@@ -181,22 +182,24 @@ fn scan_file(path: &Path, block_size: usize) -> Result<ScanResult, ScanError> {
 }
 
 fn crawl_paths(paths: &[PathBuf], block_size: usize, scanned_tx: mpsc::SyncSender<ScanResult>) {
-    let walk_iter = paths.iter().flat_map(|path| {
-        WalkDir::new(path)
-            .same_file_system(true)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
-    });
+    paths
+        .iter()
+        .flat_map(|path| {
+            WalkDir::new(path)
+                .same_file_system(true)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_file())
+        })
+        .par_bridge()
+        .for_each(|entry| {
+            let path = entry.path();
+            let scan_result = scan_file(path, block_size);
 
-    for entry in walk_iter {
-        let path = entry.path();
-        let scan_result = scan_file(path, block_size);
-
-        if let Ok(scan_result) = scan_result {
-            scanned_tx.send(scan_result).unwrap();
-        }
-    }
+            if let Ok(scan_result) = scan_result {
+                scanned_tx.send(scan_result).unwrap();
+            }
+        });
 }
 
 fn main() {
