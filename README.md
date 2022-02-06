@@ -1,4 +1,4 @@
-#🗜️ fsdedup - Simple disk space optimization for Btrfs
+# 🗜️ fsdedup - Simple disk space optimization for Btrfs
 
 ## Building the app
 Just run
